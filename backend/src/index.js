@@ -2,6 +2,7 @@ const { MongoClient } = require('mongodb');
 const cors = require('cors');
 const express = require('express');
 const { calculateAIPriority, sortByPriority } = require('./utils/priorityAI');
+const { generateSampleLogs } = require('./utils/sampleData');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -11,9 +12,12 @@ app.use(express.json());
 
 let db;
 let logsCollection;
+let demoMode = false;
 
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017';
 const DB_NAME = 'cloudlog_ai';
+
+let inMemoryLogs = [];
 
 async function connectToMongoDB() {
   try {
@@ -26,15 +30,23 @@ async function connectToMongoDB() {
     const count = await logsCollection.countDocuments();
     if (count === 0) {
       await seedSampleData();
+    } else {
+      console.log(`Found ${count} existing logs in MongoDB`);
     }
   } catch (error) {
-    console.error('MongoDB connection error:', error);
-    console.log('Running in demo mode without MongoDB');
+    console.error('MongoDB connection error:', error.message);
+    console.log('Running in DEMO MODE with in-memory data');
+    demoMode = true;
+    initializeDemoData();
   }
 }
 
+function initializeDemoData() {
+  inMemoryLogs = generateSampleLogs(150);
+  console.log(`Demo mode: Generated ${inMemoryLogs.length} sample logs`);
+}
+
 async function seedSampleData() {
-  const { generateSampleLogs } = require('./utils/sampleData');
   const sampleLogs = generateSampleLogs(150);
   
   for (const log of sampleLogs) {
@@ -42,8 +54,10 @@ async function seedSampleData() {
     log.createdAt = new Date(log.timestamp);
   }
   
-  await logsCollection.insertMany(sampleLogs);
-  console.log(`Seeded ${sampleLogs.length} sample logs to MongoDB`);
+  if (logsCollection) {
+    await logsCollection.insertMany(sampleLogs);
+    console.log(`Seeded ${sampleLogs.length} sample logs to MongoDB`);
+  }
 }
 
 app.post('/api/logs', async (req, res) => {
@@ -60,14 +74,17 @@ app.post('/api/logs', async (req, res) => {
     service: service || 'unknown',
     message,
     metadata: metadata || {},
-    aiPriority: 0,
+    aiPriority: calculateAIPriority({ severity, message }),
     createdAt: new Date()
   };
 
-  log.aiPriority = calculateAIPriority(log);
-
   if (logsCollection) {
     await logsCollection.insertOne(log);
+  } else {
+    inMemoryLogs.unshift(log);
+    if (inMemoryLogs.length > 500) {
+      inMemoryLogs = inMemoryLogs.slice(0, 500);
+    }
   }
 
   res.status(201).json(log);
@@ -76,38 +93,37 @@ app.post('/api/logs', async (req, res) => {
 app.get('/api/logs', async (req, res) => {
   const { severity, service, minPriority, maxPriority, search, sort } = req.query;
   
-  let query = {};
+  let logs;
+  if (logsCollection) {
+    logs = await logsCollection.find().toArray();
+  } else {
+    logs = [...inMemoryLogs];
+  }
 
   if (severity) {
     const severities = severity.split(',');
-    query.severity = { $in: severities };
+    logs = logs.filter(log => severities.includes(log.severity));
   }
 
   if (service) {
     const services = service.split(',');
-    query.service = { $in: services };
+    logs = logs.filter(log => services.includes(log.service));
   }
 
   if (minPriority) {
-    query.aiPriority = { ...query.aiPriority, $gte: parseInt(minPriority) };
+    logs = logs.filter(log => log.aiPriority >= parseInt(minPriority));
   }
 
   if (maxPriority) {
-    query.aiPriority = { ...query.aiPriority, $lte: parseInt(maxPriority) };
+    logs = logs.filter(log => log.aiPriority <= parseInt(maxPriority));
   }
 
   if (search) {
-    query.$or = [
-      { message: { $regex: search, $options: 'i' } },
-      { service: { $regex: search, $options: 'i' } }
-    ];
-  }
-
-  let logs;
-  if (logsCollection) {
-    logs = await logsCollection.find(query).toArray();
-  } else {
-    return res.json([]);
+    const searchLower = search.toLowerCase();
+    logs = logs.filter(log => 
+      log.message?.toLowerCase().includes(searchLower) ||
+      log.service?.toLowerCase().includes(searchLower)
+    );
   }
 
   if (sort === 'priority') {
@@ -126,7 +142,10 @@ app.get('/api/logs/:id', async (req, res) => {
   let log;
   if (logsCollection) {
     log = await logsCollection.findOne({ id: req.params.id });
+  } else {
+    log = inMemoryLogs.find(l => l.id === req.params.id);
   }
+  
   if (!log) {
     return res.status(404).json({ error: 'Log not found' });
   }
@@ -136,6 +155,8 @@ app.get('/api/logs/:id', async (req, res) => {
 app.delete('/api/logs/:id', async (req, res) => {
   if (logsCollection) {
     await logsCollection.deleteOne({ id: req.params.id });
+  } else {
+    inMemoryLogs = inMemoryLogs.filter(l => l.id !== req.params.id);
   }
   res.json({ message: 'Log deleted successfully' });
 });
@@ -144,6 +165,8 @@ app.get('/api/analytics/summary', async (req, res) => {
   let logs = [];
   if (logsCollection) {
     logs = await logsCollection.find().toArray();
+  } else {
+    logs = inMemoryLogs;
   }
   
   const total = logs.length;
@@ -189,21 +212,15 @@ app.get('/api/analytics/timeline', async (req, res) => {
   let logs = [];
   if (logsCollection) {
     logs = await logsCollection.find().toArray();
+  } else {
+    logs = inMemoryLogs;
   }
 
   let interval;
   switch(period) {
-    case '24h':
-      interval = 3600000;
-      break;
-    case '7d':
-      interval = 86400000;
-      break;
-    case '30d':
-      interval = 86400000;
-      break;
-    default:
-      interval = 3600000;
+    case '24h': interval = 3600000; break;
+    case '7d': case '30d': interval = 86400000; break;
+    default: interval = 3600000;
   }
 
   const timeline = {};
@@ -225,13 +242,18 @@ app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     timestamp: new Date().toISOString(),
-    mongodb: logsCollection ? 'connected' : 'disconnected'
+    mode: demoMode ? 'demo' : 'production',
+    mongodb: logsCollection ? 'connected' : 'disconnected',
+    logCount: logsCollection 
+      ? 0 // Would need async call
+      : inMemoryLogs.length
   });
 });
 
 connectToMongoDB().then(() => {
   app.listen(PORT, () => {
     console.log(`CloudLog AI Backend running on port ${PORT}`);
+    console.log(demoMode ? '📊 DEMO MODE - Using sample data' : '🗄️ MONGODB CONNECTED');
   });
 });
 
