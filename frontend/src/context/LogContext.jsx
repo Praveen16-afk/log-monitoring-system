@@ -24,7 +24,7 @@ export function LogProvider({ children }) {
       if (filters.search) params.append('search', filters.search);
       params.append('sort', filters.sort);
 
-      const response = await fetch(`${API_URL}/logs?${params}`);
+      const response = await fetch(`${API_URL}/api/logs?${params}`);
       const data = await response.json();
       setLogs(data);
     } catch (error) {
@@ -34,7 +34,7 @@ export function LogProvider({ children }) {
 
   const fetchAnalytics = async () => {
     try {
-      const response = await fetch(`${API_URL}/analytics/summary`);
+      const response = await fetch(`${API_URL}/api/analytics/summary`);
       const data = await response.json();
       setAnalytics(data);
     } catch (error) {
